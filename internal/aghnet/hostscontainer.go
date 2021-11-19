@@ -43,6 +43,9 @@ type HostsContainer struct {
 	// engine serves rulesStrg.
 	engine *urlfilter.DNSEngine
 
+	// translator maps generated $dnsrewrite rules into hosts-syntax rules.
+	translator map[string]string
+
 	// done is the channel to sign closing the container.
 	done chan struct{}
 
@@ -119,8 +122,15 @@ func NewHostsContainer(
 }
 
 // MatchRequest is the request processing method to resolve hostnames and
-// addresses from the operating system's hosts files.  res is nil for any
-// request having not an A/AAAA or PTR type.  It's safe for concurrent use.
+// addresses from the operating system's hosts files.
+//
+// res is nil for any request having not an A/AAAA or PTR type.  Results
+// containing CNAME information may be queried again with the same question type
+// and the returned CNAME for Host field of request.  Results are guaranteed to
+// be direct, i.e. any returned CNAME resolves into actual address like an alias
+// in hosts does, see man hosts (5).
+//
+// It's also safe for concurrent use.
 func (hc *HostsContainer) MatchRequest(
 	req urlfilter.DNSRequest,
 ) (res *urlfilter.DNSResult, ok bool) {
@@ -135,6 +145,15 @@ func (hc *HostsContainer) MatchRequest(
 	defer hc.engLock.RUnlock()
 
 	return hc.engine.MatchRequest(req)
+}
+
+// Translate returns the source hosts-syntax rule for the generated dnsrewrite
+// rule or an empty string if the last doesn't exist.
+func (hc *HostsContainer) Translate(rule string) (hostRule string) {
+	hc.engLock.RLock()
+	defer hc.engLock.RUnlock()
+
+	return hc.translator[rule]
 }
 
 // Close implements the io.Closer interface for *HostsContainer.  Close must
@@ -204,10 +223,16 @@ func (hc *HostsContainer) handleEvents() {
 }
 
 // hostsParser is a helper type to parse rules from the operating system's hosts
-// file.
+// file.  It exists for only a single refreshing session.
 type hostsParser struct {
 	// rules builds the resulting rules list content.
 	rules *strings.Builder
+
+	// syntax maps generated $dnsrewrite rules into hosts-syntax rules.
+	syntax map[string]string
+
+	// cnameSet prevents duplicating cname rules.
+	cnameSet *stringutil.Set
 
 	// table stores only the unique IP-hostname pairs.  It's also sent to the
 	// updates channel afterwards.
@@ -217,7 +242,10 @@ type hostsParser struct {
 func (hc *HostsContainer) newHostsParser() (hp *hostsParser) {
 	return &hostsParser{
 		rules: &strings.Builder{},
-		table: netutil.NewIPMap(hc.last.Len()),
+		// For A/AAAA and PTRs.
+		syntax:   make(map[string]string, hc.last.Len()*2),
+		cnameSet: stringutil.NewSet(),
+		table:    netutil.NewIPMap(hc.last.Len()),
 	}
 }
 
@@ -235,9 +263,7 @@ func (hp *hostsParser) parseFile(
 			continue
 		}
 
-		for _, host := range hosts {
-			hp.addPair(ip, host)
-		}
+		hp.addPairs(ip, hosts)
 	}
 
 	return nil, true, s.Err()
@@ -245,7 +271,6 @@ func (hp *hostsParser) parseFile(
 
 // parseLine parses the line having the hosts syntax ignoring invalid ones.
 func (hp *hostsParser) parseLine(line string) (ip net.IP, hosts []string) {
-	line = strings.TrimSpace(line)
 	fields := strings.Fields(line)
 	if len(fields) < 2 {
 		return nil, nil
@@ -275,74 +300,150 @@ loop:
 	return ip, hosts
 }
 
-// add returns true if the pair of ip and host wasn't added to the hp before.
-func (hp *hostsParser) add(ip net.IP, host string) (added bool) {
+// Simple types of hosts in hosts database.  Zero value isn't used to be able
+// quizzaciously emulate nil with 0.
+const (
+	_ = iota
+	hostAlias
+	hostMain
+)
+
+// add tries to add the ip-host pair.  It returns:
+//
+//   hostAlias if the host is not the first one added for the ip.
+//   hostMain  if the host is the first one added for the ip.
+//   0         if the ip-host pair has already been added.
+//
+func (hp *hostsParser) add(ip net.IP, host string) (hostType int) {
 	v, ok := hp.table.Get(ip)
-	hosts, _ := v.(*stringutil.Set)
-	switch {
+	switch hosts, _ := v.(*stringutil.Set); {
 	case ok && hosts.Has(host):
-		return false
+		return 0
 	case hosts == nil:
 		hosts = stringutil.NewSet(host)
 		hp.table.Set(ip, hosts)
+
+		return hostMain
 	default:
 		hosts.Add(host)
-	}
 
-	return true
+		return hostAlias
+	}
 }
 
-// addPair puts the pair of ip and host to the rules builder if needed.
-func (hp *hostsParser) addPair(ip net.IP, host string) {
+// addPair puts the pair of ip and host to the rules builder if needed.  For
+// each ip the first member of hosts will become the main one.
+func (hp *hostsParser) addPairs(ip net.IP, hosts []string) {
+	// Preproccesed format like:
+	//
+	//   ip host1 host2 ...
+	//
+	hostsLine := strings.Join(append([]string{ip.String()}, hosts...), " ")
+	var mainHost string
+	for _, host := range hosts {
+		switch hp.add(ip, host) {
+		case 0:
+			continue
+		case hostMain:
+			mainHost = host
+			added, addedPtr := hp.writeMainHostRule(host, ip)
+			hp.syntax[added], hp.syntax[addedPtr] = hostsLine, hostsLine
+		case hostAlias:
+			pair := fmt.Sprint(host, " ", mainHost)
+			if hp.cnameSet.Has(pair) {
+				continue
+			}
+			// Since the hostAlias couldn't be returned from add before the
+			// hostMain the mainHost shouldn't appear empty.
+			hp.writeAliasHostRule(host, mainHost)
+			hp.cnameSet.Add(pair)
+		}
+
+		log.Debug("%s: added ip-host pair %q-%q", hostsContainerPref, ip, host)
+	}
+}
+
+// writeAliasHostRule writes the CNAME rule for the alias-host pair into
+// internal builders.
+func (hp *hostsParser) writeAliasHostRule(alias, host string) {
+	const (
+		nl = "\n"
+		sc = ";"
+
+		rwSuccess = rules.MaskSeparator + "$dnsrewrite=NOERROR" + sc + "CNAME" + sc
+		constLen  = len(rules.MaskStartURL) + len(rwSuccess) + len(nl)
+	)
+
+	hp.rules.Grow(constLen + len(host) + len(alias))
+	stringutil.WriteToBuilder(hp.rules, rules.MaskStartURL, alias, rwSuccess, host, nl)
+}
+
+// writeMainHostRule writes the actual rule for the qtype and the PTR for the
+// host-ip pair into internal builders.
+func (hp *hostsParser) writeMainHostRule(host string, ip net.IP) (added, addedPtr string) {
 	arpa, err := netutil.IPToReversedAddr(ip)
 	if err != nil {
 		return
 	}
 
-	if !hp.add(ip, host) {
-		return
-	}
-
-	qtype := "AAAA"
-	if ip.To4() != nil {
-		// Assume the validation of the IP address is performed already.
-		qtype = "A"
-	}
-
 	const (
 		nl = "\n"
 		sc = ";"
+		sp = " "
 
-		rewriteSuccess    = "$dnsrewrite=NOERROR" + sc
-		rewriteSuccessPTR = rewriteSuccess + "PTR" + sc
+		a    = "A"
+		aaaa = "AAAA"
+		ptr  = "PTR"
+
+		rwSuccess    = "$dnsrewrite=NOERROR" + sc
+		rwSuccessPTR = rwSuccess + ptr + sc
+
+		constLen    = len(rules.MaskStartURL) + len(rules.MaskSeparator) + len(rwSuccess) + len(sc)
+		constLenPtr = len(rules.MaskStartURL) + len(rules.MaskSeparator) + len(rwSuccessPTR)
 	)
+
+	var qtype string
+	// The validation of the IP address has been performed earlier so it is
+	// guaranteed to be either an IPv4 or an IPv6.
+	if ip.To4() != nil {
+		qtype = a
+	} else {
+		qtype = aaaa
+	}
 
 	ipStr := ip.String()
 	fqdn := dns.Fqdn(host)
 
-	for _, ruleData := range [...][]string{{
-		// A/AAAA.
+	rule := &strings.Builder{}
+	rule.Grow(constLen + len(host) + len(qtype) + len(ipStr))
+	stringutil.WriteToBuilder(
+		rule,
 		rules.MaskStartURL,
 		host,
 		rules.MaskSeparator,
-		rewriteSuccess,
+		rwSuccess,
 		qtype,
 		sc,
 		ipStr,
-		nl,
-	}, {
-		// PTR.
+	)
+	added = rule.String()
+
+	rule.Reset()
+	rule.Grow(constLenPtr + len(arpa) + len(fqdn))
+	stringutil.WriteToBuilder(
+		rule,
 		rules.MaskStartURL,
 		arpa,
 		rules.MaskSeparator,
-		rewriteSuccessPTR,
+		rwSuccessPTR,
 		fqdn,
-		nl,
-	}} {
-		stringutil.WriteToBuilder(hp.rules, ruleData...)
-	}
+	)
+	addedPtr = rule.String()
 
-	log.Debug("%s: added ip-host pair %q/%q", hostsContainerPref, ip, host)
+	hp.rules.Grow(len(added) + len(addedPtr) + 2*len(nl))
+	stringutil.WriteToBuilder(hp.rules, added, nl, addedPtr, nl)
+
+	return added, addedPtr
 }
 
 // equalSet returns true if the internal hosts table just parsed equals target.
@@ -381,7 +482,7 @@ func (hp *hostsParser) sendUpd(ch chan *netutil.IPMap) {
 	case ch <- upd:
 		// The previous update was just read and the next one pushed.  Go on.
 	default:
-		log.Debug("%s: the channel is broken", hostsContainerPref)
+		log.Error("%s: the updates channel is broken", hostsContainerPref)
 	}
 }
 
@@ -420,15 +521,18 @@ func (hc *HostsContainer) refresh() (err error) {
 		return fmt.Errorf("initializing rules storage: %w", err)
 	}
 
-	hc.resetEng(rulesStrg)
+	hc.resetEng(rulesStrg, hp.syntax)
 
 	return nil
 }
 
-func (hc *HostsContainer) resetEng(rulesStrg *filterlist.RuleStorage) {
+// resetEng updates container's engine and the translation map.
+func (hc *HostsContainer) resetEng(rulesStrg *filterlist.RuleStorage, syntax map[string]string) {
 	hc.engLock.Lock()
 	defer hc.engLock.Unlock()
 
 	hc.rulesStrg = rulesStrg
 	hc.engine = urlfilter.NewDNSEngine(hc.rulesStrg)
+
+	hc.translator = syntax
 }
