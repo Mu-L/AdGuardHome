@@ -28,13 +28,9 @@ func DefaultHostsPaths() (paths []string) {
 	return defaultHostsPaths()
 }
 
-// hostsContainerPref is a prefix for logging and wrapping errors in
-// HostsContainer's methods.
-const hostsContainerPref = "hosts container"
-
-// HostsContainer stores the relevant hosts database provided by the OS and
-// processes both A/AAAA and PTR DNS requests for those.
-type HostsContainer struct {
+// requestMatcher combines the logic for matching requests and translating the
+// appropriate rules.
+type requestMatcher struct {
 	// engLock protects rulesStrg and engine.
 	engLock *sync.RWMutex
 
@@ -45,6 +41,64 @@ type HostsContainer struct {
 
 	// translator maps generated $dnsrewrite rules into hosts-syntax rules.
 	translator map[string]string
+}
+
+// MatchRequest processes the request rewriting hostnames and addresses read
+// from the operating system's hosts files.
+//
+// res is nil for any request having not an A/AAAA or PTR type.  Results
+// containing CNAME information may be queried again with the same question type
+// and the returned CNAME for Host field of request.  Results are guaranteed to
+// be direct, i.e. any returned CNAME resolves into actual address like an alias
+// in hosts does, see man hosts (5).
+//
+// It's also safe for concurrent use.
+func (rm *requestMatcher) MatchRequest(
+	req urlfilter.DNSRequest,
+) (res *urlfilter.DNSResult, ok bool) {
+	switch req.DNSType {
+	case dns.TypeA, dns.TypeAAAA, dns.TypePTR:
+		log.Debug("%s: handling the request", hostsContainerPref)
+	default:
+		return nil, false
+	}
+
+	rm.engLock.RLock()
+	defer rm.engLock.RUnlock()
+
+	return rm.engine.MatchRequest(req)
+}
+
+// Translate returns the source hosts-syntax rule for the generated dnsrewrite
+// rule or an empty string if the last doesn't exist.
+func (rm *requestMatcher) Translate(rule string) (hostRule string) {
+	rm.engLock.RLock()
+	defer rm.engLock.RUnlock()
+
+	return rm.translator[rule]
+}
+
+// resetEng updates container's engine and the translation map.
+func (rm *requestMatcher) resetEng(rulesStrg *filterlist.RuleStorage, syntax map[string]string) {
+	rm.engLock.Lock()
+	defer rm.engLock.Unlock()
+
+	rm.rulesStrg = rulesStrg
+	rm.engine = urlfilter.NewDNSEngine(rm.rulesStrg)
+
+	rm.translator = syntax
+}
+
+// hostsContainerPref is a prefix for logging and wrapping errors in
+// HostsContainer's methods.
+const hostsContainerPref = "hosts container"
+
+// HostsContainer stores the relevant hosts database provided by the OS and
+// processes both A/AAAA and PTR DNS requests for those.
+type HostsContainer struct {
+	// requestMatcher matches the requests and translates the rules.  It's
+	// embedded to implement MatchRequest and Translate for *HostsContainer.
+	requestMatcher
 
 	// done is the channel to sign closing the container.
 	done chan struct{}
@@ -90,7 +144,9 @@ func NewHostsContainer(
 	}
 
 	hc = &HostsContainer{
-		engLock:  &sync.RWMutex{},
+		requestMatcher: requestMatcher{
+			engLock: &sync.RWMutex{},
+		},
 		done:     make(chan struct{}, 1),
 		updates:  make(chan *netutil.IPMap, 1),
 		last:     &netutil.IPMap{},
@@ -119,41 +175,6 @@ func NewHostsContainer(
 	go hc.handleEvents()
 
 	return hc, nil
-}
-
-// MatchRequest is the request processing method to resolve hostnames and
-// addresses from the operating system's hosts files.
-//
-// res is nil for any request having not an A/AAAA or PTR type.  Results
-// containing CNAME information may be queried again with the same question type
-// and the returned CNAME for Host field of request.  Results are guaranteed to
-// be direct, i.e. any returned CNAME resolves into actual address like an alias
-// in hosts does, see man hosts (5).
-//
-// It's also safe for concurrent use.
-func (hc *HostsContainer) MatchRequest(
-	req urlfilter.DNSRequest,
-) (res *urlfilter.DNSResult, ok bool) {
-	switch req.DNSType {
-	case dns.TypeA, dns.TypeAAAA, dns.TypePTR:
-		log.Debug("%s: handling the request", hostsContainerPref)
-	default:
-		return nil, false
-	}
-
-	hc.engLock.RLock()
-	defer hc.engLock.RUnlock()
-
-	return hc.engine.MatchRequest(req)
-}
-
-// Translate returns the source hosts-syntax rule for the generated dnsrewrite
-// rule or an empty string if the last doesn't exist.
-func (hc *HostsContainer) Translate(rule string) (hostRule string) {
-	hc.engLock.RLock()
-	defer hc.engLock.RUnlock()
-
-	return hc.translator[rule]
 }
 
 // Close implements the io.Closer interface for *HostsContainer.  Close must
@@ -228,7 +249,7 @@ type hostsParser struct {
 	// rules builds the resulting rules list content.
 	rules *strings.Builder
 
-	// syntax maps generated $dnsrewrite rules into hosts-syntax rules.
+	// syntax maps generated $dnsrewrite rules to the hosts-syntax rules.
 	syntax map[string]string
 
 	// cnameSet prevents duplicating cname rules.
@@ -334,7 +355,7 @@ func (hp *hostsParser) add(ip net.IP, host string) (hostType int) {
 // addPair puts the pair of ip and host to the rules builder if needed.  For
 // each ip the first member of hosts will become the main one.
 func (hp *hostsParser) addPairs(ip net.IP, hosts []string) {
-	// Preproccesed format like:
+	// Put the rule in a preproccesed format like:
 	//
 	//   ip host1 host2 ...
 	//
@@ -489,6 +510,7 @@ func (hp *hostsParser) sendUpd(ch chan *netutil.IPMap) {
 // newStrg creates a new rules storage from parsed data.
 func (hp *hostsParser) newStrg() (s *filterlist.RuleStorage, err error) {
 	return filterlist.NewRuleStorage([]filterlist.RuleList{&filterlist.StringRuleList{
+		// TODO(e.burkov):  Make configurable.
 		ID:             -1,
 		RulesText:      hp.rules.String(),
 		IgnoreCosmetic: true,
@@ -524,15 +546,4 @@ func (hc *HostsContainer) refresh() (err error) {
 	hc.resetEng(rulesStrg, hp.syntax)
 
 	return nil
-}
-
-// resetEng updates container's engine and the translation map.
-func (hc *HostsContainer) resetEng(rulesStrg *filterlist.RuleStorage, syntax map[string]string) {
-	hc.engLock.Lock()
-	defer hc.engLock.Unlock()
-
-	hc.rulesStrg = rulesStrg
-	hc.engine = urlfilter.NewDNSEngine(hc.rulesStrg)
-
-	hc.translator = syntax
 }

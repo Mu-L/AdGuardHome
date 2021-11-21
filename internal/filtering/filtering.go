@@ -807,8 +807,6 @@ func (d *DNSFilter) matchHost(
 	}
 
 	dnsres, ok := d.filteringEngine.MatchRequest(ureq)
-	log.Debug("MATCHING REQUEST: %#v", dnsres)
-
 	// Check DNS rewrites first, because the API there is a bit awkward.
 	if dnsr := dnsres.DNSRewrites(); len(dnsr) > 0 {
 		res = d.processDNSRewrites(dnsr)
