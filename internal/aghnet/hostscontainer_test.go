@@ -382,7 +382,7 @@ func TestHostsContainer(t *testing.T) {
 		OnClose:  func() (err error) { panic("not implemented") },
 	}
 
-	hc, err := NewHostsContainer(testdata, &stubWatcher, "etc/hosts")
+	hc, err := NewHostsContainer(testdata, &stubWatcher, "etc_hosts")
 	require.NoError(t, err)
 
 	for _, tc := range testCases {

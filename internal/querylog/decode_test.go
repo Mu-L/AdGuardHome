@@ -36,7 +36,6 @@ func TestDecodeLogEntry(t *testing.T) {
 			`"Result":{` +
 			`"IsFiltered":true,` +
 			`"Reason":3,` +
-			// `"ReverseHosts":["example.net"],` +
 			`"IPList":["127.0.0.2"],` +
 			`"Rules":[{"FilterListID":42,"Text":"||an.yandex.ru","IP":"127.0.0.2"},` +
 			`{"FilterListID":43,"Text":"||an2.yandex.ru","IP":"127.0.0.3"}],` +

@@ -31,8 +31,8 @@ func DefaultHostsPaths() (paths []string) {
 // requestMatcher combines the logic for matching requests and translating the
 // appropriate rules.
 type requestMatcher struct {
-	// engLock protects rulesStrg and engine.
-	engLock *sync.RWMutex
+	// stateLock protects all the fields of requestMatcher.
+	stateLock *sync.RWMutex
 
 	// rulesStrg stores the rules obtained from the hosts' file.
 	rulesStrg *filterlist.RuleStorage
@@ -40,6 +40,8 @@ type requestMatcher struct {
 	engine *urlfilter.DNSEngine
 
 	// translator maps generated $dnsrewrite rules into hosts-syntax rules.
+	//
+	// TODO(e.burkov):  Store the filename from which the rule was parsed.
 	translator map[string]string
 }
 
@@ -52,7 +54,7 @@ type requestMatcher struct {
 // be direct, i.e. any returned CNAME resolves into actual address like an alias
 // in hosts does, see man hosts (5).
 //
-// It's also safe for concurrent use.
+// It's safe for concurrent use.
 func (rm *requestMatcher) MatchRequest(
 	req urlfilter.DNSRequest,
 ) (res *urlfilter.DNSResult, ok bool) {
@@ -63,8 +65,8 @@ func (rm *requestMatcher) MatchRequest(
 		return nil, false
 	}
 
-	rm.engLock.RLock()
-	defer rm.engLock.RUnlock()
+	rm.stateLock.RLock()
+	defer rm.stateLock.RUnlock()
 
 	return rm.engine.MatchRequest(req)
 }
@@ -72,21 +74,21 @@ func (rm *requestMatcher) MatchRequest(
 // Translate returns the source hosts-syntax rule for the generated dnsrewrite
 // rule or an empty string if the last doesn't exist.
 func (rm *requestMatcher) Translate(rule string) (hostRule string) {
-	rm.engLock.RLock()
-	defer rm.engLock.RUnlock()
+	rm.stateLock.RLock()
+	defer rm.stateLock.RUnlock()
 
 	return rm.translator[rule]
 }
 
 // resetEng updates container's engine and the translation map.
-func (rm *requestMatcher) resetEng(rulesStrg *filterlist.RuleStorage, syntax map[string]string) {
-	rm.engLock.Lock()
-	defer rm.engLock.Unlock()
+func (rm *requestMatcher) resetEng(rulesStrg *filterlist.RuleStorage, tr map[string]string) {
+	rm.stateLock.Lock()
+	defer rm.stateLock.Unlock()
 
 	rm.rulesStrg = rulesStrg
 	rm.engine = urlfilter.NewDNSEngine(rm.rulesStrg)
 
-	rm.translator = syntax
+	rm.translator = tr
 }
 
 // hostsContainerPref is a prefix for logging and wrapping errors in
@@ -145,7 +147,7 @@ func NewHostsContainer(
 
 	hc = &HostsContainer{
 		requestMatcher: requestMatcher{
-			engLock: &sync.RWMutex{},
+			stateLock: &sync.RWMutex{},
 		},
 		done:     make(chan struct{}, 1),
 		updates:  make(chan *netutil.IPMap, 1),
@@ -246,11 +248,12 @@ func (hc *HostsContainer) handleEvents() {
 // hostsParser is a helper type to parse rules from the operating system's hosts
 // file.  It exists for only a single refreshing session.
 type hostsParser struct {
-	// rules builds the resulting rules list content.
-	rules *strings.Builder
+	// rulesBuilder builds the resulting rulesBuilder list content.
+	rulesBuilder *strings.Builder
 
-	// syntax maps generated $dnsrewrite rules to the hosts-syntax rules.
-	syntax map[string]string
+	// translations maps generated $dnsrewrite rules to the hosts-translations
+	// rules.
+	translations map[string]string
 
 	// cnameSet prevents duplicating cname rules.
 	cnameSet *stringutil.Set
@@ -262,11 +265,11 @@ type hostsParser struct {
 
 func (hc *HostsContainer) newHostsParser() (hp *hostsParser) {
 	return &hostsParser{
-		rules: &strings.Builder{},
+		rulesBuilder: &strings.Builder{},
 		// For A/AAAA and PTRs.
-		syntax:   make(map[string]string, hc.last.Len()*2),
-		cnameSet: stringutil.NewSet(),
-		table:    netutil.NewIPMap(hc.last.Len()),
+		translations: make(map[string]string, hc.last.Len()*2),
+		cnameSet:     stringutil.NewSet(),
+		table:        netutil.NewIPMap(hc.last.Len()),
 	}
 }
 
@@ -368,7 +371,7 @@ func (hp *hostsParser) addPairs(ip net.IP, hosts []string) {
 		case hostMain:
 			mainHost = host
 			added, addedPtr := hp.writeMainHostRule(host, ip)
-			hp.syntax[added], hp.syntax[addedPtr] = hostsLine, hostsLine
+			hp.translations[added], hp.translations[addedPtr] = hostsLine, hostsLine
 		case hostAlias:
 			pair := fmt.Sprint(host, " ", mainHost)
 			if hp.cnameSet.Has(pair) {
@@ -395,8 +398,8 @@ func (hp *hostsParser) writeAliasHostRule(alias, host string) {
 		constLen  = len(rules.MaskStartURL) + len(rwSuccess) + len(nl)
 	)
 
-	hp.rules.Grow(constLen + len(host) + len(alias))
-	stringutil.WriteToBuilder(hp.rules, rules.MaskStartURL, alias, rwSuccess, host, nl)
+	hp.rulesBuilder.Grow(constLen + len(host) + len(alias))
+	stringutil.WriteToBuilder(hp.rulesBuilder, rules.MaskStartURL, alias, rwSuccess, host, nl)
 }
 
 // writeMainHostRule writes the actual rule for the qtype and the PTR for the
@@ -409,60 +412,52 @@ func (hp *hostsParser) writeMainHostRule(host string, ip net.IP) (added, addedPt
 
 	const (
 		nl = "\n"
-		sc = ";"
-		sp = " "
 
-		a    = "A"
-		aaaa = "AAAA"
-		ptr  = "PTR"
+		rwSuccess    = "^$dnsrewrite=NOERROR;"
+		rwSuccessPTR = "^$dnsrewrite=NOERROR;PTR;"
 
-		rwSuccess    = "$dnsrewrite=NOERROR" + sc
-		rwSuccessPTR = rwSuccess + ptr + sc
-
-		constLen    = len(rules.MaskStartURL) + len(rules.MaskSeparator) + len(rwSuccess) + len(sc)
-		constLenPtr = len(rules.MaskStartURL) + len(rules.MaskSeparator) + len(rwSuccessPTR)
+		modLen    = len("||") + len(rwSuccess)
+		modLenPTR = len("||") + len(rwSuccessPTR)
 	)
 
 	var qtype string
 	// The validation of the IP address has been performed earlier so it is
 	// guaranteed to be either an IPv4 or an IPv6.
 	if ip.To4() != nil {
-		qtype = a
+		qtype = "A"
 	} else {
-		qtype = aaaa
+		qtype = "AAAA"
 	}
 
 	ipStr := ip.String()
 	fqdn := dns.Fqdn(host)
 
-	rule := &strings.Builder{}
-	rule.Grow(constLen + len(host) + len(qtype) + len(ipStr))
+	ruleBuilder := &strings.Builder{}
+	ruleBuilder.Grow(modLen + len(host) + len(qtype) + len(ipStr))
 	stringutil.WriteToBuilder(
-		rule,
-		rules.MaskStartURL,
+		ruleBuilder,
+		"||",
 		host,
-		rules.MaskSeparator,
 		rwSuccess,
 		qtype,
-		sc,
+		";",
 		ipStr,
 	)
-	added = rule.String()
+	added = ruleBuilder.String()
 
-	rule.Reset()
-	rule.Grow(constLenPtr + len(arpa) + len(fqdn))
+	ruleBuilder.Reset()
+	ruleBuilder.Grow(modLenPTR + len(arpa) + len(fqdn))
 	stringutil.WriteToBuilder(
-		rule,
-		rules.MaskStartURL,
+		ruleBuilder,
+		"||",
 		arpa,
-		rules.MaskSeparator,
 		rwSuccessPTR,
 		fqdn,
 	)
-	addedPtr = rule.String()
+	addedPtr = ruleBuilder.String()
 
-	hp.rules.Grow(len(added) + len(addedPtr) + 2*len(nl))
-	stringutil.WriteToBuilder(hp.rules, added, nl, addedPtr, nl)
+	hp.rulesBuilder.Grow(len(added) + len(addedPtr) + 2*len(nl))
+	stringutil.WriteToBuilder(hp.rulesBuilder, added, nl, addedPtr, nl)
 
 	return added, addedPtr
 }
@@ -512,7 +507,7 @@ func (hp *hostsParser) newStrg() (s *filterlist.RuleStorage, err error) {
 	return filterlist.NewRuleStorage([]filterlist.RuleList{&filterlist.StringRuleList{
 		// TODO(e.burkov):  Make configurable.
 		ID:             -1,
-		RulesText:      hp.rules.String(),
+		RulesText:      hp.rulesBuilder.String(),
 		IgnoreCosmetic: true,
 	}})
 }
@@ -543,7 +538,7 @@ func (hc *HostsContainer) refresh() (err error) {
 		return fmt.Errorf("initializing rules storage: %w", err)
 	}
 
-	hc.resetEng(rulesStrg, hp.syntax)
+	hc.resetEng(rulesStrg, hp.translations)
 
 	return nil
 }
