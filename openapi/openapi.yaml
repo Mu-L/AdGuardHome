@@ -566,6 +566,26 @@
               'schema':
                 '$ref': '#/components/schemas/Error'
           'description': 'Not implemented (for example, on Windows).'
+  '/dhcp/update_static_lease':
+    'post':
+      'tags':
+      - 'dhcp'
+      'operationId': 'dhcpUpdateStaticLease'
+      'description': >
+        Updates IP address, hostname of the static lease.  IP version must be
+        the same as previous.
+      'summary': 'Updates a static lease'
+      'requestBody':
+        '$ref': '#/components/requestBodies/DhcpStaticLease'
+      'responses':
+        '200':
+          'description': 'OK.'
+        '501':
+          'content':
+            'application/json':
+              'schema':
+                '$ref': '#/components/schemas/Error'
+          'description': 'Not implemented (for example, on Windows).'
   '/dhcp/reset':
     'post':
       'tags':
@@ -914,6 +934,9 @@
           'description': 'OK.'
   '/clients/find':
     'get':
+      'deprecated': true
+      'description': >
+        Deprecated: Use `POST /clients/search` instead.
       'tags':
       - 'clients'
       'operationId': 'clientsFind'
@@ -930,6 +953,26 @@
           TODO(a.garipov): Replace with a better query API.
         'schema':
           'type': 'string'
+      'responses':
+        '200':
+          'description': 'OK.'
+          'content':
+            'application/json':
+              'schema':
+                '$ref': '#/components/schemas/ClientsFindResponse'
+  '/clients/search':
+    'post':
+      'tags':
+      - 'clients'
+      'operationId': 'clientsSearch'
+      'summary': >
+        Get information about clients by their IP addresses, CIDRs, MAC addresses, or ClientIDs.
+      'requestBody':
+        'content':
+          'application/json':
+            'schema':
+              '$ref': '#/components/schemas/ClientsSearchRequest'
+        'required': true
       'responses':
         '200':
           'description': 'OK.'
@@ -1448,6 +1491,23 @@
           'type': 'boolean'
         'ratelimit':
           'type': 'integer'
+        'ratelimit_subnet_subnet_len_ipv4':
+          'description': 'Length of the subnet mask for IPv4 addresses.'
+          'type': 'integer'
+          'default': 24
+          'minimum': 0
+          'maximum': 32
+        'ratelimit_subnet_subnet_len_ipv6':
+          'description': 'Length of the subnet mask for IPv6 addresses.'
+          'type': 'integer'
+          'default': 56
+          'minimum': 0
+          'maximum': 128
+        'ratelimit_whitelist':
+          'type': 'array'
+          'description': 'List of IP addresses excluded from rate limiting.'
+          'items':
+            'type': 'string'
         'blocking_mode':
           'type': 'string'
           'enum':
@@ -1460,6 +1520,10 @@
           'type': 'string'
         'blocking_ipv6':
           'type': 'string'
+        'blocked_response_ttl':
+          'type': 'integer'
+          'minimum': 0
+          'description': 'TTL for blocked responses.'
         'protection_disabled_until':
           'type': 'string'
           'description': 'Protection is pause until this time.  Nullable.'
@@ -1483,10 +1547,15 @@
         'cache_optimistic':
           'type': 'boolean'
         'upstream_mode':
+          'type': 'string'
           'enum':
-          - ''
-          - 'parallel'
-          - 'fastest_addr'
+          - const: ''
+            deprecated: true
+            description: Use `load_balance` instead.
+          - const: 'fastest_addr'
+          - const: 'load_balance'
+          - const: 'parallel'
+          'description': Upstream modes enumeration.
         'use_private_ptr_resolvers':
           'type': 'boolean'
         'resolve_clients':
@@ -2422,14 +2491,21 @@
           'example': true
           'description': >
             Set to true if both certificate and private key are correct.
+        'serve_plain_dns':
+          'type': 'boolean'
+          'example': true
+          'description': >
+            Set to true if plain DNS is allowed for incoming requests.
     'NetInterface':
       'type': 'object'
       'description': 'Network interface info'
       'required':
       - 'flags'
+      - 'gateway_ip'
       - 'hardware_address'
+      - 'ipv4_addresses'
+      - 'ipv6_addresses'
       - 'name'
-      - 'mtu'
       'properties':
         'flags':
           'type': 'string'
@@ -2438,18 +2514,28 @@
             the "|" character: "up", "broadcast", "loopback", "pointtopoint" and
             "multicast".
           'example': 'up|broadcast|multicast'
+        'gateway_ip':
+          'type': 'string'
+          'description': 'The IP address of the gateway.'
+          'example': '192.0.2.0'
         'hardware_address':
           'type': 'string'
           'example': '52:54:00:11:09:ba'
+        'ipv4_addresses':
+          'type': 'array'
+          'description': >
+            The addresses of the interface of v4 family.
+          'items':
+            'type': 'string'
+        'ipv6_addresses':
+          'type': 'array'
+          'description': >
+            The addresses of the interface of v6 family.
+          'items':
+            'type': 'string'
         'name':
           'type': 'string'
           'example': 'eth0'
-        'ip_addresses':
-          'type': 'array'
-          'items':
-            'type': 'string'
-        'mtu':
-          'type': 'integer'
     'AddressInfo':
       'type': 'object'
       'description': 'Port information'
@@ -2526,6 +2612,8 @@
         'bing':
           'type': 'boolean'
         'duckduckgo':
+          'type': 'boolean'
+        'ecosia':
           'type': 'boolean'
         'google':
           'type': 'boolean'
@@ -2645,6 +2733,25 @@
 
             This behaviour can be changed in the future versions.
           'type': 'boolean'
+        'upstreams_cache_enabled':
+          'description': |
+            NOTE: If `upstreams_cache_enabled` is not set in HTTP API
+            `GET /clients/add` request then default value (false) will be used.
+
+            If `upstreams_cache_enabled` is not set in HTTP API
+            `GET /clients/update` request then the existing value will not be
+            changed.
+
+            This behaviour can be changed in the future versions.
+          'type': 'boolean'
+        'upstreams_cache_size':
+          'description': |
+            NOTE: If `upstreams_cache_enabled` is not set in HTTP API
+            `GET /clients/update` request then the existing value will not be
+            changed.
+
+            This behaviour can be changed in the future versions.
+          'type': 'integer'
     'ClientAuto':
       'type': 'object'
       'description': 'Auto-Client information'
@@ -2677,6 +2784,20 @@
       'properties':
         'name':
           'type': 'string'
+    'ClientsSearchRequest':
+      'type': 'object'
+      'description': 'Client search request'
+      'properties':
+        'clients':
+          'type': 'array'
+          'items':
+            '$ref': '#/components/schemas/ClientsSearchRequestItem'
+    'ClientsSearchRequestItem':
+      'type': 'object'
+      'properties':
+        'id':
+          'type': 'string'
+          'description': 'Client IP address, CIDR, MAC address, or ClientID'
     'ClientsFindResponse':
       'type': 'array'
       'description': 'Client search results.'

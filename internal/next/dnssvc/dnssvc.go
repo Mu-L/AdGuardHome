@@ -7,16 +7,20 @@ package dnssvc
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync/atomic"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/next/agh"
+
 	// TODO(a.garipov): Add a “dnsproxy proxy” package to shield us from changes
 	// and replacement of module dnsproxy.
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
+	"github.com/AdguardTeam/golibs/errors"
 )
 
 // Service is the AdGuard Home DNS service.  A nil *Service is a valid
@@ -25,8 +29,10 @@ import (
 // TODO(a.garipov): Consider saving a [*proxy.Config] instance for those
 // fields that are only used in [New] and [Service.Config].
 type Service struct {
+	logger              *slog.Logger
 	proxy               *proxy.Proxy
 	bootstraps          []string
+	bootstrapResolvers  []*upstream.UpstreamResolver
 	upstreams           []string
 	dns64Prefixes       []netip.Prefix
 	upsTimeout          time.Duration
@@ -44,6 +50,7 @@ func New(c *Config) (svc *Service, err error) {
 	}
 
 	svc = &Service{
+		logger:              c.Logger,
 		bootstraps:          c.BootstrapServers,
 		upstreams:           c.UpstreamServers,
 		dns64Prefixes:       c.DNS64Prefixes,
@@ -52,7 +59,7 @@ func New(c *Config) (svc *Service, err error) {
 		useDNS64:            c.UseDNS64,
 	}
 
-	upstreams, err := addressesToUpstreams(
+	upstreams, resolvers, err := addressesToUpstreams(
 		c.UpstreamServers,
 		c.BootstrapServers,
 		c.UpstreamTimeout,
@@ -62,19 +69,17 @@ func New(c *Config) (svc *Service, err error) {
 		return nil, fmt.Errorf("converting upstreams: %w", err)
 	}
 
-	svc.proxy = &proxy.Proxy{
-		Config: proxy.Config{
-			UDPListenAddr: udpAddrs(c.Addresses),
-			TCPListenAddr: tcpAddrs(c.Addresses),
-			UpstreamConfig: &proxy.UpstreamConfig{
-				Upstreams: upstreams,
-			},
-			UseDNS64:   c.UseDNS64,
-			DNS64Prefs: c.DNS64Prefixes,
+	svc.bootstrapResolvers = resolvers
+	svc.proxy, err = proxy.New(&proxy.Config{
+		Logger:        svc.logger,
+		UDPListenAddr: udpAddrs(c.Addresses),
+		TCPListenAddr: tcpAddrs(c.Addresses),
+		UpstreamConfig: &proxy.UpstreamConfig{
+			Upstreams: upstreams,
 		},
-	}
-
-	err = svc.proxy.Init()
+		UseDNS64:   c.UseDNS64,
+		DNS64Prefs: c.DNS64Prefixes,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
@@ -90,20 +95,37 @@ func addressesToUpstreams(
 	bootstraps []string,
 	timeout time.Duration,
 	preferIPv6 bool,
-) (upstreams []upstream.Upstream, err error) {
+) (upstreams []upstream.Upstream, boots []*upstream.UpstreamResolver, err error) {
+	opts := &upstream.Options{
+		Timeout:    timeout,
+		PreferIPv6: preferIPv6,
+	}
+
+	boots, err = aghnet.ParseBootstraps(bootstraps, opts)
+	if err != nil {
+		// Don't wrap the error, since it's informative enough as is.
+		return nil, nil, err
+	}
+
+	// TODO(e.burkov):  Add system hosts resolver here.
+	var bootstrap upstream.ParallelResolver
+	for _, r := range boots {
+		bootstrap = append(bootstrap, upstream.NewCachingResolver(r))
+	}
+
 	upstreams = make([]upstream.Upstream, len(upsStrs))
 	for i, upsStr := range upsStrs {
 		upstreams[i], err = upstream.AddressToUpstream(upsStr, &upstream.Options{
-			Bootstrap:  bootstraps,
+			Bootstrap:  bootstrap,
 			Timeout:    timeout,
 			PreferIPv6: preferIPv6,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("upstream at index %d: %w", i, err)
+			return nil, boots, fmt.Errorf("upstream at index %d: %w", i, err)
 		}
 	}
 
-	return upstreams, nil
+	return upstreams, boots, nil
 }
 
 // tcpAddrs converts []netip.AddrPort into []*net.TCPAddr.
@@ -135,12 +157,12 @@ func udpAddrs(addrPorts []netip.AddrPort) (udpAddrs []*net.UDPAddr) {
 }
 
 // type check
-var _ agh.Service = (*Service)(nil)
+var _ agh.ServiceWithConfig[*Config] = (*Service)(nil)
 
 // Start implements the [agh.Service] interface for *Service.  svc may be nil.
 // After Start exits, all DNS servers have tried to start, but there is no
 // guarantee that they did.  Errors from the servers are written to the log.
-func (svc *Service) Start() (err error) {
+func (svc *Service) Start(ctx context.Context) (err error) {
 	if svc == nil {
 		return nil
 	}
@@ -152,7 +174,7 @@ func (svc *Service) Start() (err error) {
 		svc.running.Store(err == nil)
 	}()
 
-	return svc.proxy.Start()
+	return svc.proxy.Start(ctx)
 }
 
 // Shutdown implements the [agh.Service] interface for *Service.  svc may be
@@ -162,7 +184,15 @@ func (svc *Service) Shutdown(ctx context.Context) (err error) {
 		return nil
 	}
 
-	return svc.proxy.Stop()
+	errs := []error{
+		svc.proxy.Shutdown(ctx),
+	}
+
+	for _, b := range svc.bootstrapResolvers {
+		errs = append(errs, errors.Annotate(b.Close(), "closing bootstrap %s: %w", b.Address()))
+	}
+
+	return errors.Join(errs...)
 }
 
 // Config returns the current configuration of the web service.  Config must not
@@ -189,6 +219,7 @@ func (svc *Service) Config() (c *Config) {
 	}
 
 	c = &Config{
+		Logger:              svc.logger,
 		Addresses:           addrs,
 		BootstrapServers:    svc.bootstraps,
 		UpstreamServers:     svc.upstreams,

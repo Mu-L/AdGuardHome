@@ -7,36 +7,36 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghio"
+	"github.com/AdguardTeam/golibs/ioutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestLimitRequestBody(t *testing.T) {
-	errReqLimitReached := &aghio.LimitReachedError{
-		Limit: defaultReqBodySzLim,
+	errReqLimitReached := &ioutil.LimitError{
+		Limit: defaultReqBodySzLim.Bytes(),
 	}
 
 	testCases := []struct {
+		wantErr error
 		name    string
 		body    string
 		want    []byte
-		wantErr error
 	}{{
+		wantErr: nil,
 		name:    "not_so_big",
 		body:    "somestr",
 		want:    []byte("somestr"),
-		wantErr: nil,
 	}, {
+		wantErr: errReqLimitReached,
 		name:    "so_big",
 		body:    string(make([]byte, defaultReqBodySzLim+1)),
 		want:    make([]byte, defaultReqBodySzLim),
-		wantErr: errReqLimitReached,
 	}, {
+		wantErr: nil,
 		name:    "empty",
 		body:    "",
 		want:    []byte(nil),
-		wantErr: nil,
 	}}
 
 	makeHandler := func(t *testing.T, err *error) http.HandlerFunc {

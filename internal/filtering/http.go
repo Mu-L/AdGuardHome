@@ -8,25 +8,32 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/rulelist"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
 	"github.com/miekg/dns"
-	"golang.org/x/exp/slices"
 )
 
 // validateFilterURL validates the filter list URL or file name.
-func validateFilterURL(urlStr string) (err error) {
+func (d *DNSFilter) validateFilterURL(urlStr string) (err error) {
 	defer func() { err = errors.Annotate(err, "checking filter: %w") }()
 
 	if filepath.IsAbs(urlStr) {
+		urlStr = filepath.Clean(urlStr)
 		_, err = os.Stat(urlStr)
 		if err != nil {
 			// Don't wrap the error since it's informative enough as is.
 			return err
+		}
+
+		if !pathMatchesAny(d.safeFSPatterns, urlStr) {
+			return fmt.Errorf("path %q does not match safe patterns", urlStr)
 		}
 
 		return nil
@@ -34,14 +41,14 @@ func validateFilterURL(urlStr string) (err error) {
 
 	u, err := url.ParseRequestURI(urlStr)
 	if err != nil {
-		// Don't wrap the error since it's informative enough as is.
+		// Don't wrap the error, because it's informative enough as is.
 		return err
-	} else if s := u.Scheme; s != aghhttp.SchemeHTTP && s != aghhttp.SchemeHTTPS {
-		return &url.Error{
-			Op:  "Check scheme",
-			URL: urlStr,
-			Err: fmt.Errorf("only %v allowed", []string{aghhttp.SchemeHTTP, aghhttp.SchemeHTTPS}),
-		}
+	}
+
+	err = urlutil.ValidateHTTPURL(u)
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		return err
 	}
 
 	return nil
@@ -62,7 +69,7 @@ func (d *DNSFilter) handleFilteringAddURL(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err = validateFilterURL(fj.URL)
+	err = d.validateFilterURL(fj.URL)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
@@ -84,7 +91,7 @@ func (d *DNSFilter) handleFilteringAddURL(w http.ResponseWriter, r *http.Request
 		Name:    fj.Name,
 		white:   fj.Whitelist,
 		Filter: Filter{
-			ID: assignUniqueFilterID(),
+			ID: d.idGen.next(),
 		},
 	}
 
@@ -222,7 +229,7 @@ func (d *DNSFilter) handleFilteringSetURL(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	err = validateFilterURL(fj.Data.URL)
+	err = d.validateFilterURL(fj.Data.URL)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "invalid url: %s", err)
 
@@ -305,12 +312,12 @@ func (d *DNSFilter) handleFilteringRefresh(w http.ResponseWriter, r *http.Reques
 }
 
 type filterJSON struct {
-	URL         string `json:"url"`
-	Name        string `json:"name"`
-	LastUpdated string `json:"last_updated,omitempty"`
-	ID          int64  `json:"id"`
-	RulesCount  uint32 `json:"rules_count"`
-	Enabled     bool   `json:"enabled"`
+	URL         string               `json:"url"`
+	Name        string               `json:"name"`
+	LastUpdated string               `json:"last_updated,omitempty"`
+	ID          rulelist.URLFilterID `json:"id"`
+	RulesCount  uint32               `json:"rules_count"`
+	Enabled     bool                 `json:"enabled"`
 }
 
 type filteringConfig struct {
@@ -386,8 +393,8 @@ func (d *DNSFilter) handleFilteringConfig(w http.ResponseWriter, r *http.Request
 }
 
 type checkHostRespRule struct {
-	Text         string `json:"text"`
-	FilterListID int64  `json:"filter_list_id"`
+	Text         string               `json:"text"`
+	FilterListID rulelist.URLFilterID `json:"filter_list_id"`
 }
 
 type checkHostResp struct {
@@ -410,7 +417,7 @@ type checkHostResp struct {
 	// FilterID is the ID of the rule's filter list.
 	//
 	// Deprecated: Use Rules[*].FilterListID.
-	FilterID int64 `json:"filter_id"`
+	FilterID rulelist.URLFilterID `json:"filter_id"`
 }
 
 func (d *DNSFilter) handleCheckHost(w http.ResponseWriter, r *http.Request) {
