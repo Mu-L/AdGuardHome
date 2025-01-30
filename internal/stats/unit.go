@@ -5,14 +5,15 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"go.etcd.io/bbolt"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -62,17 +63,19 @@ type Entry struct {
 	// Domain is the domain name requested.
 	Domain string
 
-	// Upstream is the upstream DNS server.
-	Upstream string
+	// UpstreamStats contains the DNS query statistics for both the upstream and
+	// fallback DNS servers.
+	UpstreamStats []*proxy.UpstreamStatistics
 
 	// Result is the result of processing the request.
 	Result Result
 
-	// Time is the duration of the request processing.
-	Time time.Duration
+	// ProcessingTime is the duration of the request processing from the start
+	// of the request including timeouts.
+	ProcessingTime time.Duration
 }
 
-// validate returs an error if entry is not valid.
+// validate returns an error if entry is not valid.
 func (e *Entry) validate() (err error) {
 	switch {
 	case e.Result == 0:
@@ -103,8 +106,8 @@ type unit struct {
 	// upstreamsResponses stores the number of responses from each upstream.
 	upstreamsResponses map[string]uint64
 
-	// upstreamsTimeSum stores the sum of processing time in microseconds of
-	// responses from each upstream.
+	// upstreamsTimeSum stores the sum of durations of successful queries in
+	// microseconds to each upstream.
 	upstreamsTimeSum map[string]uint64
 
 	// nResult stores the number of requests grouped by it's result.
@@ -230,18 +233,15 @@ func (a countPair) compareCount(b countPair) (res int) {
 	}
 }
 
-func convertMapToSlice(m map[string]uint64, max int) (s []countPair) {
+func convertMapToSlice(m map[string]uint64, maxVal int) (s []countPair) {
 	s = make([]countPair, 0, len(m))
 	for k, v := range m {
 		s = append(s, countPair{Name: k, Count: v})
 	}
 
 	slices.SortFunc(s, countPair.compareCount)
-	if max > len(s) {
-		max = len(s)
-	}
 
-	return s[:max]
+	return s[:min(maxVal, len(s))]
 }
 
 func convertSliceToMap(a []countPair) (m map[string]uint64) {
@@ -273,13 +273,14 @@ func (u *unit) serialize() (udb *unitDB) {
 	}
 }
 
-func loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
+// loadUnitFromDB loads unit by id from the database.
+func (s *StatsCtx) loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
 	bkt := tx.Bucket(idToUnitName(id))
 	if bkt == nil {
 		return nil
 	}
 
-	log.Tracef("Loading unit %d", id)
+	s.logger.Debug("loading unit", "id", id)
 
 	var buf bytes.Buffer
 	buf.Write(bkt.Get([]byte{0}))
@@ -287,7 +288,7 @@ func loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
 
 	err := gob.NewDecoder(&buf).Decode(udb)
 	if err != nil {
-		log.Error("gob Decode: %s", err)
+		s.logger.Error("gob decode", slogutil.KeyError, err)
 
 		return nil
 	}
@@ -295,7 +296,7 @@ func loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
 	return udb
 }
 
-// deserealize assigns the appropriate values from udb to u.  u must not be nil.
+// deserialize assigns the appropriate values from udb to u.  u must not be nil.
 // It's safe for concurrent use.
 func (u *unit) deserialize(udb *unitDB) {
 	if udb == nil {
@@ -323,19 +324,24 @@ func (u *unit) add(e *Entry) {
 	}
 
 	u.clients[e.Client]++
-	t := uint64(e.Time.Microseconds())
-	u.timeSum += t
+	pt := uint64(e.ProcessingTime.Microseconds())
+	u.timeSum += pt
 	u.nTotal++
 
-	if e.Upstream != "" {
-		u.upstreamsResponses[e.Upstream]++
-		u.upstreamsTimeSum[e.Upstream] += t
+	for _, s := range e.UpstreamStats {
+		if s.IsCached || s.Error != nil {
+			continue
+		}
+
+		addr := s.Address
+		u.upstreamsResponses[addr]++
+		u.upstreamsTimeSum[addr] += uint64(s.QueryDuration.Microseconds())
 	}
 }
 
 // flushUnitToDB puts udb to the database at id.
-func (udb *unitDB) flushUnitToDB(tx *bbolt.Tx, id uint32) (err error) {
-	log.Debug("stats: flushing unit with id %d and total of %d", id, udb.NTotal)
+func (s *StatsCtx) flushUnitToDB(udb *unitDB, tx *bbolt.Tx, id uint32) (err error) {
+	s.logger.Debug("flushing unit", "id", id, "req_num", udb.NTotal)
 
 	bkt, err := tx.CreateBucketIfNotExists(idToUnitName(id))
 	if err != nil {
@@ -505,6 +511,10 @@ func (s *StatsCtx) fillCollectedStats(data *StatsResp, units []*unitDB, curID ui
 
 // fillCollectedStatsDaily fills data with collected daily statistics.  units
 // must contain data for the count of days.
+//
+// TODO(s.chzhen):  Improve collection of statistics for frontend.  Dashboard
+// cards should contain statistics for the whole interval without rounding to
+// days.
 func (s *StatsCtx) fillCollectedStatsDaily(
 	data *StatsResp,
 	units []*unitDB,
@@ -516,9 +526,8 @@ func (s *StatsCtx) fillCollectedStatsDaily(
 	hours := countHours(curHour, days)
 	units = units[len(units)-hours:]
 
-	for i := 0; i < len(units); i++ {
+	for i, u := range units {
 		day := i / 24
-		u := units[i]
 
 		data.DNSQueries[day] += u.NTotal
 		data.BlockedFiltering[day] += u.NResult[RFiltered]
@@ -602,9 +611,7 @@ func microsecondsToSeconds(n float64) (r float64) {
 func prepareTopUpstreamsAvgTime(
 	upstreamsAvgTime topAddrsFloat,
 ) (topUpstreamsAvgTime []topAddrsFloat) {
-	keys := maps.Keys(upstreamsAvgTime)
-
-	slices.SortFunc(keys, func(a, b string) (res int) {
+	keys := slices.SortedStableFunc(maps.Keys(upstreamsAvgTime), func(a, b string) (res int) {
 		switch x, y := upstreamsAvgTime[a], upstreamsAvgTime[b]; {
 		case x > y:
 			return -1

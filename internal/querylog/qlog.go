@@ -2,15 +2,18 @@
 package querylog
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"sync"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/miekg/dns"
 )
@@ -21,6 +24,10 @@ const queryLogFileName = "querylog.json"
 
 // queryLog is a structure that writes and reads the DNS query log.
 type queryLog struct {
+	// logger is used for logging the operation of the query log.  It must not
+	// be nil.
+	logger *slog.Logger
+
 	// confMu protects conf.
 	confMu *sync.RWMutex
 
@@ -29,12 +36,12 @@ type queryLog struct {
 
 	findClient func(ids []string) (c *Client, err error)
 
-	// logFile is the path to the log file.
-	logFile string
-
 	// buffer contains recent log entries.  The entries in this buffer must not
 	// be modified.
-	buffer []*logEntry
+	buffer *container.RingBuffer[*logEntry]
+
+	// logFile is the path to the log file.
+	logFile string
 
 	// bufferLock protects buffer.
 	bufferLock sync.RWMutex
@@ -75,24 +82,34 @@ func NewClientProto(s string) (cp ClientProto, err error) {
 	}
 }
 
-func (l *queryLog) Start() {
+// type check
+var _ QueryLog = (*queryLog)(nil)
+
+// Start implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) Start(ctx context.Context) (err error) {
 	if l.conf.HTTPRegister != nil {
 		l.initWeb()
 	}
 
-	go l.periodicRotate()
+	go l.periodicRotate(ctx)
+
+	return nil
 }
 
-func (l *queryLog) Close() {
+// Shutdown implements the [QueryLog] interface for *queryLog.
+func (l *queryLog) Shutdown(ctx context.Context) (err error) {
 	l.confMu.RLock()
 	defer l.confMu.RUnlock()
 
 	if l.conf.FileEnabled {
-		err := l.flushLogBuffer()
+		err = l.flushLogBuffer(ctx)
 		if err != nil {
-			log.Error("querylog: closing: %s", err)
+			// Don't wrap the error because it's informative enough as is.
+			return err
 		}
 	}
+
+	return nil
 }
 
 func checkInterval(ivl time.Duration) (ok bool) {
@@ -122,6 +139,7 @@ func validateIvl(ivl time.Duration) (err error) {
 	return nil
 }
 
+// WriteDiskConfig implements the [QueryLog] interface for *queryLog.
 func (l *queryLog) WriteDiskConfig(c *Config) {
 	l.confMu.RLock()
 	defer l.confMu.RUnlock()
@@ -130,7 +148,7 @@ func (l *queryLog) WriteDiskConfig(c *Config) {
 }
 
 // Clear memory buffer and remove log files
-func (l *queryLog) clear() {
+func (l *queryLog) clear(ctx context.Context) {
 	l.fileFlushLock.Lock()
 	defer l.fileFlushLock.Unlock()
 
@@ -138,26 +156,31 @@ func (l *queryLog) clear() {
 		l.bufferLock.Lock()
 		defer l.bufferLock.Unlock()
 
-		l.buffer = nil
+		l.buffer.Clear()
 		l.flushPending = false
 	}()
 
 	oldLogFile := l.logFile + ".1"
 	err := os.Remove(oldLogFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Error("removing old log file %q: %s", oldLogFile, err)
+		l.logger.ErrorContext(
+			ctx,
+			"removing old log file",
+			"file", oldLogFile,
+			slogutil.KeyError, err,
+		)
 	}
 
 	err = os.Remove(l.logFile)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Error("removing log file %q: %s", l.logFile, err)
+		l.logger.ErrorContext(ctx, "removing log file", "file", l.logFile, slogutil.KeyError, err)
 	}
 
-	log.Debug("querylog: cleared")
+	l.logger.DebugContext(ctx, "cleared")
 }
 
 // newLogEntry creates an instance of logEntry from parameters.
-func newLogEntry(params *AddParams) (entry *logEntry) {
+func newLogEntry(ctx context.Context, logger *slog.Logger, params *AddParams) (entry *logEntry) {
 	q := params.Question.Question[0]
 	qHost := aghnet.NormalizeDomain(q.Name)
 
@@ -186,8 +209,8 @@ func newLogEntry(params *AddParams) (entry *logEntry) {
 		entry.ReqECS = params.ReqECS.String()
 	}
 
-	entry.addResponse(params.Answer, false)
-	entry.addResponse(params.OrigAnswer, true)
+	entry.addResponse(ctx, logger, params.Answer, false)
+	entry.addResponse(ctx, logger, params.OrigAnswer, true)
 
 	return entry
 }
@@ -195,7 +218,7 @@ func newLogEntry(params *AddParams) (entry *logEntry) {
 // Add implements the [QueryLog] interface for *queryLog.
 func (l *queryLog) Add(params *AddParams) {
 	var isEnabled, fileIsEnabled bool
-	var memSize uint32
+	var memSize uint
 	func() {
 		l.confMu.RLock()
 		defer l.confMu.RUnlock()
@@ -208,9 +231,12 @@ func (l *queryLog) Add(params *AddParams) {
 		return
 	}
 
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
+
 	err := params.validate()
 	if err != nil {
-		log.Error("querylog: adding record: %s, skipping", err)
+		l.logger.ErrorContext(ctx, "adding record", slogutil.KeyError, err)
 
 		return
 	}
@@ -219,38 +245,21 @@ func (l *queryLog) Add(params *AddParams) {
 		params.Result = &filtering.Result{}
 	}
 
-	entry := newLogEntry(params)
+	entry := newLogEntry(ctx, l.logger, params)
 
-	needFlush := false
-	func() {
-		l.bufferLock.Lock()
-		defer l.bufferLock.Unlock()
+	l.bufferLock.Lock()
+	defer l.bufferLock.Unlock()
 
-		l.buffer = append(l.buffer, entry)
+	l.buffer.Push(entry)
 
-		if !fileIsEnabled {
-			if len(l.buffer) > int(memSize) {
-				// Writing to file is disabled, so just remove the oldest entry
-				// from the slices.
-				//
-				// TODO(a.garipov): This should be replaced by a proper ring
-				// buffer, but it's currently difficult to do that.
-				l.buffer[0] = nil
-				l.buffer = l.buffer[1:]
-			}
-		} else if !l.flushPending {
-			needFlush = len(l.buffer) >= int(memSize)
-			if needFlush {
-				l.flushPending = true
-			}
-		}
-	}()
+	if !l.flushPending && fileIsEnabled && l.buffer.Len() >= memSize {
+		l.flushPending = true
 
-	if needFlush {
+		// TODO(s.chzhen):  Fix occasional rewrite of entires.
 		go func() {
-			flushErr := l.flushLogBuffer()
+			flushErr := l.flushLogBuffer(ctx)
 			if flushErr != nil {
-				log.Error("querylog: flushing after adding: %s", err)
+				l.logger.ErrorContext(ctx, "flushing after adding", slogutil.KeyError, flushErr)
 			}
 		}()
 	}
@@ -263,7 +272,8 @@ func (l *queryLog) ShouldLog(host string, _, _ uint16, ids []string) bool {
 
 	c, err := l.findClient(ids)
 	if err != nil {
-		log.Error("querylog: finding client: %s", err)
+		// TODO(s.chzhen):  Pass context.
+		l.logger.ErrorContext(context.TODO(), "finding client", slogutil.KeyError, err)
 	}
 
 	if c != nil && c.IgnoreQueryLog {

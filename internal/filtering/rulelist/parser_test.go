@@ -69,12 +69,12 @@ func TestParser_Parse(t *testing.T) {
 		wantWritten:  len(testRuleTextBlocked) + len(testRuleTextHTML),
 	}, {
 		name: "title",
-		in: "! Title:  Test Title \n" +
+		in: testRuleTextTitle +
 			"! Title: Bad, Ignored Title\n" +
 			testRuleTextBlocked,
 		wantDst:      testRuleTextBlocked,
 		wantErrMsg:   "",
-		wantTitle:    "Test Title",
+		wantTitle:    testTitle,
 		wantRulesNum: 1,
 		wantWritten:  len(testRuleTextBlocked),
 	}, {
@@ -87,14 +87,14 @@ func TestParser_Parse(t *testing.T) {
 		wantWritten:  len(testRuleTextCosmetic),
 	}, {
 		name: "bad_char",
-		in: "! Title:  Test Title \n" +
+		in: testRuleTextTitle +
 			testRuleTextBlocked +
 			">>>\x7F<<<",
 		wantDst: testRuleTextBlocked,
 		wantErrMsg: "line 3: " +
 			"character 4: " +
 			"likely binary character '\\x7f'",
-		wantTitle:    "Test Title",
+		wantTitle:    testTitle,
 		wantRulesNum: 1,
 		wantWritten:  len(testRuleTextBlocked),
 	}, {
@@ -132,7 +132,6 @@ func TestParser_Parse(t *testing.T) {
 	}}
 
 	for _, tc := range testCases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
@@ -216,7 +215,7 @@ func BenchmarkParser_Parse(b *testing.B) {
 
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		resSink, errSink = p.Parse(dst, src, buf)
 		dst.Reset()
 	}

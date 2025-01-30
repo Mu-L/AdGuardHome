@@ -1,10 +1,15 @@
 package dhcpsvc
 
 import (
-	"net/netip"
+	"fmt"
+	"log/slog"
+	"maps"
+	"os"
+	"slices"
 	"time"
 
-	"github.com/google/gopacket/layers"
+	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/netutil"
 )
 
 // Config is the configuration for the DHCP service.
@@ -13,9 +18,15 @@ type Config struct {
 	// interface identified by its name.
 	Interfaces map[string]*InterfaceConfig
 
+	// Logger will be used to log the DHCP events.
+	Logger *slog.Logger
+
 	// LocalDomainName is the top-level domain name to use for resolving DHCP
 	// clients' hostnames.
 	LocalDomainName string
+
+	// DBFilePath is the path to the database file containing the DHCP leases.
+	DBFilePath string
 
 	// ICMPTimeout is the timeout for checking another DHCP server's presence.
 	ICMPTimeout time.Duration
@@ -33,54 +44,65 @@ type InterfaceConfig struct {
 	IPv6 *IPv6Config
 }
 
-// IPv4Config is the interface-specific configuration for DHCPv4.
-type IPv4Config struct {
-	// GatewayIP is the IPv4 address of the network's gateway.  It is used as
-	// the default gateway for DHCP clients and also used in calculating the
-	// network-specific broadcast address.
-	GatewayIP netip.Addr
+// Validate returns an error in conf if any.
+//
+// TODO(e.burkov):  Unexport and rewrite the test.
+func (conf *Config) Validate() (err error) {
+	switch {
+	case conf == nil:
+		return errNilConfig
+	case !conf.Enabled:
+		return nil
+	}
 
-	// SubnetMask is the IPv4 subnet mask of the network.  It should be a valid
-	// IPv4 subnet mask (i.e. all 1s followed by all 0s).
-	SubnetMask netip.Addr
+	var errs []error
+	if conf.ICMPTimeout < 0 {
+		err = newMustErr("icmp timeout", "be non-negative", conf.ICMPTimeout)
+		errs = append(errs, err)
+	}
 
-	// RangeStart is the first address in the range to assign to DHCP clients.
-	RangeStart netip.Addr
+	err = netutil.ValidateDomainName(conf.LocalDomainName)
+	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
+		errs = append(errs, err)
+	}
 
-	// RangeEnd is the last address in the range to assign to DHCP clients.
-	RangeEnd netip.Addr
+	// This is a best-effort check for the file accessibility.  The file will be
+	// checked again when it is opened later.
+	if _, err = os.Stat(conf.DBFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, fmt.Errorf("db file path %q: %w", conf.DBFilePath, err))
+	}
 
-	// Options is the list of DHCP options to send to DHCP clients.
-	Options layers.DHCPOptions
+	if len(conf.Interfaces) == 0 {
+		errs = append(errs, errNoInterfaces)
 
-	// LeaseDuration is the TTL of a DHCP lease.
-	LeaseDuration time.Duration
+		return errors.Join(errs...)
+	}
 
-	// Enabled is the state of the DHCPv4 service, whether it is enabled or not
-	// on the specific interface.
-	Enabled bool
+	for _, iface := range slices.Sorted(maps.Keys(conf.Interfaces)) {
+		ic := conf.Interfaces[iface]
+		err = ic.validate()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("interface %q: %w", iface, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
-// IPv6Config is the interface-specific configuration for DHCPv6.
-type IPv6Config struct {
-	// RangeStart is the first address in the range to assign to DHCP clients.
-	RangeStart netip.Addr
+// validate returns an error in ic, if any.
+func (ic *InterfaceConfig) validate() (err error) {
+	if ic == nil {
+		return errNilConfig
+	}
 
-	// Options is the list of DHCP options to send to DHCP clients.
-	Options layers.DHCPOptions
+	if err = ic.IPv4.validate(); err != nil {
+		return fmt.Errorf("ipv4: %w", err)
+	}
 
-	// LeaseDuration is the TTL of a DHCP lease.
-	LeaseDuration time.Duration
+	if err = ic.IPv6.validate(); err != nil {
+		return fmt.Errorf("ipv6: %w", err)
+	}
 
-	// RASlaacOnly defines whether the DHCP clients should only use SLAAC for
-	// address assignment.
-	RASLAACOnly bool
-
-	// RAAllowSlaac defines whether the DHCP clients may use SLAAC for address
-	// assignment.
-	RAAllowSLAAC bool
-
-	// Enabled is the state of the DHCPv6 service, whether it is enabled or not
-	// on the specific interface.
-	Enabled bool
+	return nil
 }
